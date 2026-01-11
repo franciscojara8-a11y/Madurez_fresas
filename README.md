@@ -1,0 +1,1 @@
+Este código permite clasificar las fresas por su cantitada de píxeles rojos, ignorando los cépalos. solo basta con tomar una foto mediante cámara o subir una imágen, te permite recortar el área a clasificar, cuenta con overlay para visualizar el área de estudio.
