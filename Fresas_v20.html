@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Madurez de Fresas – v20 (Subir + Cámara)</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+
+<style>
+  body{font-family:Arial;margin:20px}
+  .row{display:flex;gap:30px;flex-wrap:wrap;align-items:flex-start}
+  .panel{border:1px solid #ccc;padding:15px;width:560px;border-radius:12px}
+  canvas{border:1px solid #ccc;border-radius:12px;cursor:crosshair}
+  .mono{font-family:Consolas;white-space:pre-line}
+  input[type=range]{width:100%}
+  button{padding:8px 12px;margin-right:6px;margin-top:6px}
+  button:disabled{opacity:.6}
+  .small{font-size:13px;color:#444;line-height:1.35}
+  label{user-select:none}
+  .legend{display:flex;gap:12px;align-items:center;margin-top:6px;flex-wrap:wrap}
+  .dot{width:12px;height:12px;border-radius:50%}
+  .camBox{border:1px dashed #bbb;border-radius:12px;padding:10px;margin-top:10px}
+  video{width:100%;max-width:520px;border-radius:12px;border:1px solid #ccc}
+</style>
+</head>
+
+<body>
+
+<h2>Detección de madurez de fresas (v20)</h2>
+<p class="small">
+Subir imagen o tomar foto. Recorte manual + % rojo sobre pulpa (sépalos excluidos).  
+Reglas: &lt;40 VERDE · 40–74 PINTÓN · ≥75 MADURO.
+</p>
+
+<div class="row">
+  <div class="panel">
+
+    <b>Opción A: Subir imagen</b><br>
+    <input type="file" id="file" accept="image/*">
+
+    <div class="camBox">
+      <b>Opción B: Tomar foto con cámara</b><br>
+      <button id="startCam">Iniciar cámara</button>
+      <button id="snap" disabled>Tomar foto</button>
+      <button id="stopCam" disabled>Detener cámara</button>
+      <div class="small">Si estás en celular, permite acceso a cámara cuando el navegador lo pida.</div>
+      <video id="video" playsinline autoplay muted></video>
+    </div>
+
+    <hr>
+
+    <b>Recorte</b><br>
+    <button id="useCrop" disabled>Usar recorte</button>
+    <button id="resetCrop" disabled>Reset</button>
+    <div id="cropInfo" class="mono">Recorte: ninguno</div>
+
+    <hr>
+
+    Resolución <span id="resTxt">256</span>
+    <input type="range" id="res" min="128" max="512" step="32" value="256">
+
+    Dominancia rojo <span id="rdTxt">1.20</span>
+    <input type="range" id="rd" min="1.05" max="1.70" step="0.01" value="1.20">
+
+    Saturación mínima pulpa <span id="satTxt">0.22</span>
+    <input type="range" id="sat" min="0.10" max="0.55" step="0.01" value="0.22">
+
+    Brillo mínimo (ignorar negro) <span id="blkTxt">0.20</span>
+    <input type="range" id="blk" min="0.00" max="0.35" step="0.01" value="0.20">
+
+    Brillo mínimo rojo <span id="darkTxt">0.05</span>
+    <input type="range" id="dark" min="0.00" max="0.25" step="0.01" value="0.05">
+
+    Umbral verde sépalo (G/(R+B)) <span id="leafTxt">1.25</span>
+    <input type="range" id="leaf" min="1.05" max="1.80" step="0.01" value="1.25">
+
+    <hr>
+
+    <label class="small"><input type="checkbox" id="overlay" checked> Mostrar overlay</label>
+
+    Opacidad overlay <span id="opTxt">0.55</span>
+    <input type="range" id="op" min="0.10" max="1.00" step="0.05" value="0.55">
+
+    <div class="legend small">
+      <span class="dot" style="background:#00ff00"></span> pulpa (fruta)
+      <span class="dot" style="background:#ff0000"></span> rojo contado
+    </div>
+
+    <br>
+    <button id="calc" disabled>Calcular</button>
+    <div id="out" class="mono">—</div>
+  </div>
+
+  <div>
+    <canvas id="cv" width="740" height="500"></canvas>
+  </div>
+</div>
+
+<script>
+/* ===================== UI ===================== */
+const TH_GREEN=40, TH_MATURE=75;
+const el=id=>document.getElementById(id);
+
+["res","rd","sat","blk","dark","leaf","op"].forEach(k=>{
+  el(k).oninput=()=>{
+    const v = +el(k).value;
+    if(k==="res") el(k+"Txt").textContent = el(k).value;
+    else el(k+"Txt").textContent = v.toFixed(2);
+    if(k==="op") el("opTxt").textContent = v.toFixed(2);
+    redraw();
+  };
+});
+el("resTxt").textContent=el("res").value;
+["rd","sat","blk","dark","leaf"].forEach(k=>el(k+"Txt").textContent=(+el(k).value).toFixed(2));
+el("opTxt").textContent=(+el("op").value).toFixed(2);
+
+/* ===================== Canvas principal ===================== */
+const cv=el("cv"), ctx=cv.getContext("2d");
+const img=new Image();
+
+let draw={}, crop=null, activeCrop=null, dragging=false, start=null;
+
+// Overlay persistente
+const overlayCanvas = document.createElement("canvas");
+const overlayCtx = overlayCanvas.getContext("2d");
+let overlayReady = false;
+let overlayScope = "none"; // "crop" o "full"
+
+function invalidateOverlay(){
+  overlayReady=false;
+  overlayScope="none";
+  overlayCanvas.width=1; overlayCanvas.height=1;
+  overlayCtx.clearRect(0,0,1,1);
+}
+
+function resetCropState(){
+  crop=null; activeCrop=null;
+  el("cropInfo").textContent="Recorte: ninguno";
+  el("useCrop").disabled=true;
+  el("resetCrop").disabled=true;
+  invalidateOverlay();
+}
+
+function fit(){
+  const s=Math.min(cv.width/img.naturalWidth, cv.height/img.naturalHeight);
+  draw.w=img.naturalWidth*s; draw.h=img.naturalHeight*s;
+  draw.x=(cv.width-draw.w)/2; draw.y=(cv.height-draw.h)/2;
+}
+
+function redraw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+
+  if(img.complete && img.naturalWidth){
+    ctx.drawImage(img, draw.x, draw.y, draw.w, draw.h);
+  }
+
+  const hasCrop = !!(activeCrop && crop);
+  const scopeOK =
+    (overlayScope==="crop" && hasCrop) ||
+    (overlayScope==="full" && !hasCrop);
+
+  if(overlayReady && scopeOK && el("overlay").checked){
+    let dx,dy,dw,dh;
+    if(hasCrop){
+      dx=crop.x; dy=crop.y; dw=crop.w; dh=crop.h;
+    } else {
+      dx=draw.x; dy=draw.y; dw=draw.w; dh=draw.h;
+    }
+    ctx.save();
+    ctx.globalAlpha = +el("op").value;
+    ctx.drawImage(overlayCanvas, dx, dy, dw, dh);
+    ctx.restore();
+  }
+
+  if(crop){
+    ctx.save();
+    ctx.strokeStyle="cyan";
+    ctx.lineWidth=2;
+    ctx.strokeRect(crop.x,crop.y,crop.w,crop.h);
+    ctx.restore();
+  }
+}
+
+function clampToImage(p){
+  return{
+    x:Math.max(draw.x,Math.min(draw.x+draw.w,p.x)),
+    y:Math.max(draw.y,Math.min(draw.y+draw.h,p.y))
+  };
+}
+
+/* ===================== Recorte (mouse) ===================== */
+cv.onmousedown=e=>{
+  if(!img.complete || !img.naturalWidth) return;
+  const r=cv.getBoundingClientRect();
+  start=clampToImage({x:e.clientX-r.left,y:e.clientY-r.top});
+  crop={x:start.x,y:start.y,w:0,h:0};
+  dragging=true;
+  invalidateOverlay();
+  redraw();
+};
+
+cv.onmousemove=e=>{
+  if(!dragging) return;
+  const r=cv.getBoundingClientRect();
+  const p=clampToImage({x:e.clientX-r.left,y:e.clientY-r.top});
+  crop={
+    x:Math.min(start.x,p.x),
+    y:Math.min(start.y,p.y),
+    w:Math.abs(p.x-start.x),
+    h:Math.abs(p.y-start.y)
+  };
+  redraw();
+};
+
+window.onmouseup=()=>{
+  if(!dragging) return;
+  dragging=false;
+  if(!crop || crop.w<10 || crop.h<10){ crop=null; redraw(); return; }
+
+  const iw=img.naturalWidth, ih=img.naturalHeight;
+  activeCrop={
+    sx:Math.floor((crop.x-draw.x)/draw.w*iw),
+    sy:Math.floor((crop.y-draw.y)/draw.h*ih),
+    sw:Math.floor(crop.w/draw.w*iw),
+    sh:Math.floor(crop.h/draw.h*ih),
+  };
+
+  activeCrop.sx=Math.max(0,Math.min(iw-1,activeCrop.sx));
+  activeCrop.sy=Math.max(0,Math.min(ih-1,activeCrop.sy));
+  activeCrop.sw=Math.max(1,Math.min(iw-activeCrop.sx,activeCrop.sw));
+  activeCrop.sh=Math.max(1,Math.min(ih-activeCrop.sy,activeCrop.sh));
+
+  el("cropInfo").textContent=`Recorte listo: ${activeCrop.sw}x${activeCrop.sh} (px imagen)`;
+  el("useCrop").disabled=false;
+  el("resetCrop").disabled=false;
+  redraw();
+};
+
+el("useCrop").onclick=()=>{ el("useCrop").disabled=true; redraw(); };
+el("resetCrop").onclick=()=>{
+  resetCropState();
+  el("out").textContent="Recorte reseteado. Presiona Calcular para generar overlay nuevo.";
+  redraw();
+};
+
+el("overlay").onchange = ()=>redraw();
+
+/* ===================== Cargar imagen (archivo) ===================== */
+el("file").onchange=e=>{
+  const f=e.target.files?.[0];
+  if(!f) return;
+  img.onload=()=>{
+    fit();
+    resetCropState();
+    el("calc").disabled=false;
+    el("out").textContent="Imagen cargada. Recorta si quieres y luego calcula.";
+    redraw();
+  };
+  img.src=URL.createObjectURL(f);
+};
+
+/* ===================== Cámara ===================== */
+const video = el("video");
+let stream = null;
+
+async function startCamera(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    el("snap").disabled = false;
+    el("stopCam").disabled = false;
+    el("startCam").disabled = true;
+    el("out").textContent="Cámara iniciada. Presiona “Tomar foto”.";
+  }catch(err){
+    console.error(err);
+    el("out").textContent="No se pudo acceder a la cámara. Abre esto desde un servidor local (http://) y permite permisos.";
+  }
+}
+
+function stopCamera(){
+  if(stream){
+    stream.getTracks().forEach(t=>t.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+  el("snap").disabled = true;
+  el("stopCam").disabled = true;
+  el("startCam").disabled = false;
+}
+
+el("startCam").onclick = ()=>startCamera();
+el("stopCam").onclick = ()=>stopCamera();
+
+el("snap").onclick = ()=>{
+  if(!video.videoWidth) return;
+
+  // capturamos frame a un canvas temporal
+  const tmp = document.createElement("canvas");
+  tmp.width = video.videoWidth;
+  tmp.height = video.videoHeight;
+  tmp.getContext("2d").drawImage(video,0,0);
+
+  // convertimos a imagen para el pipeline
+  img.onload = ()=>{
+    fit();
+    resetCropState();
+    el("calc").disabled=false;
+    el("out").textContent="Foto capturada. Recorta si quieres y luego calcula.";
+    redraw();
+  };
+  img.src = tmp.toDataURL("image/jpeg", 0.92);
+};
+
+/* ===================== Cálculo + Overlay ===================== */
+function bin01(x){ return tf.clipByValue(x,0,1).round().cast("float32"); }
+
+async function computeAndMakeOverlay(){
+  const S=+el("res").value;
+  const rd=+el("rd").value;
+  const satMin=+el("sat").value;
+  const blackMin=+el("blk").value;
+  const darkMin=+el("dark").value;
+  const leafThr=+el("leaf").value;
+
+  let px=tf.browser.fromPixels(img);
+  const usingCrop = !!activeCrop;
+
+  if(usingCrop){
+    px=px.slice([activeCrop.sy,activeCrop.sx,0],[activeCrop.sh,activeCrop.sw,3]);
+  }
+
+  px=tf.image.resizeBilinear(px,[S,S],true).toFloat().div(255);
+  await tf.nextFrame();
+
+  const [r,g,b]=tf.split(px,3,2);
+  const max=tf.maximum(tf.maximum(r,g),b);
+  const min=tf.minimum(tf.minimum(r,g),b);
+  const sat=max.sub(min).div(max.add(1e-6));
+  const notBlack=max.greater(blackMin).cast("float32");
+
+  const leaf = g.div(r.add(b).add(1e-6))
+    .greater(leafThr).cast("float32")
+    .mul(sat.greater(0.18).cast("float32"))
+    .mul(notBlack);
+  const leaf01 = bin01(leaf);
+
+  let fruit = sat.greater(satMin).cast("float32").mul(notBlack).mul(tf.sub(1,leaf01));
+  fruit = bin01(fruit);
+
+  const redDom = r.div(g.add(b).add(1e-6));
+  let red = redDom.greater(rd).cast("float32")
+    .mul(max.greater(darkMin).cast("float32"))
+    .mul(fruit);
+  red = bin01(red);
+
+  const redCount = (await red.sum().data())[0];
+  const areaCount = (await fruit.sum().data())[0];
+
+  let pct = areaCount ? (redCount/areaCount*100) : 0;
+  pct = Math.max(0, Math.min(100, pct));
+
+  overlayCanvas.width=S; overlayCanvas.height=S;
+
+  const fruitArr = await fruit.data();
+  const redArr = await red.data();
+  const imgData = overlayCtx.createImageData(S,S);
+  const d=imgData.data;
+
+  for(let i=0;i<S*S;i++){
+    const isFruit=fruitArr[i]>0.5;
+    const isRed=redArr[i]>0.5;
+    if(!isFruit){ d[i*4+3]=0; continue; }
+    if(isRed){
+      d[i*4+0]=255; d[i*4+1]=0; d[i*4+2]=0; d[i*4+3]=200;
+    }else{
+      d[i*4+0]=0; d[i*4+1]=255; d[i*4+2]=0; d[i*4+3]=160;
+    }
+  }
+
+  overlayCtx.putImageData(imgData,0,0);
+  overlayReady=true;
+  overlayScope = usingCrop ? "crop" : "full";
+
+  tf.dispose([px,r,g,b,max,min,sat,notBlack,leaf,leaf01,fruit,red]);
+  return { pct };
+}
+
+el("calc").onclick=async()=>{
+  if(!img.complete || !img.naturalWidth) return;
+  el("calc").disabled=true;
+  el("out").textContent="Procesando...";
+  invalidateOverlay();
+  redraw();
+  await tf.nextFrame();
+
+  try{
+    const r=await computeAndMakeOverlay();
+    const cls = r.pct < TH_GREEN ? "VERDE" : (r.pct < TH_MATURE ? "PINTÓN" : "MADURO");
+    el("out").textContent = `% rojo (pulpa): ${r.pct.toFixed(1)}\nClasificación: ${cls}\nRecorte: ${activeCrop?"SÍ":"NO"}`;
+    redraw();
+  }catch(e){
+    console.error(e);
+    el("out").textContent="Error al calcular. Prueba bajar resolución a 128.";
+    invalidateOverlay();
+    redraw();
+  }finally{
+    el("calc").disabled=false;
+  }
+};
+
+/* ===================== Seguridad: detener cámara al salir ===================== */
+window.addEventListener("beforeunload", ()=>stopCamera());
+</script>
+
+</body>
+</html>
